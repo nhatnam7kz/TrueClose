@@ -1,5 +1,12 @@
+# Build output
 .build/
+TrueClose.app/
+TrueClose.dmg
+
+# Xcode / SPM rác
 .swiftpm/
-*.app
-*.dmg
+*.xcodeproj/xcuserdata/
+DerivedData/
+
+# macOS rác vặt
 .DS_Store
