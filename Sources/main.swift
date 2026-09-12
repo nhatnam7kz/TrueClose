@@ -259,15 +259,11 @@ class AutoQuitMonitor {
                 continue
             }
 
-            // A minimized window does not count as "open" — otherwise, a user who minimizes
-            // every window would find the app never gets auto-quit.
-            var minimizedValue: AnyObject?
-            let isMinimized = AXUIElementCopyAttributeValue(win, kAXMinimizedAttribute as CFString, &minimizedValue) == .success
-                && (minimizedValue as? Bool == true)
-
-            if !isMinimized {
-                visibleCount += 1
-            }
+            // Minimizing is NOT closing — the user explicitly chose to keep the window
+            // around, just tucked into the Dock. TrueClose should only act on windows that
+            // are actually closed (the red button), so minimized windows still count as
+            // "open" here and do not push the app toward auto-quit.
+            visibleCount += 1
         }
         return visibleCount
     }
