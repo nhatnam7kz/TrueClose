@@ -14,10 +14,16 @@
     <string>TrueClose</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+
+    <!--Đổi tên phiên bản vd 1.0.x-->
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>1.0.3</string>
+
+    <!--Tăng +1 mỗi lần build-->
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>3</string>
+    
+    
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <!-- This is a menu-bar/agent style app: no Dock icon, doesn't appear in Cmd+Tab -->
