@@ -188,6 +188,52 @@ class AutoQuitMonitor {
         RunLoop.main.add(timer!, forMode: .common)
     }
 
+    // Independent, WindowServer-level cross-check. AXUIElement enumeration goes
+    // through IPC to the target process and can misreport (return 0 successfully,
+    // or fail) for many unrelated reasons: a fullscreen game hogging the GPU, a
+    // borderless-fullscreen game with no dedicated Space, Chromium's own AX
+    // window-tree quirks, or general system load. CGWindowListCopyWindowInfo asks
+    // the WindowServer directly and doesn't share those failure modes, so we only
+    // ever trust "this app has 0 windows" when AX *and* this agree. Returns nil if
+    // the WindowServer query itself failed, so callers can treat that as "unknown"
+    // too rather than "definitely 0".
+    private func cgWindowCount(for pid: pid_t) -> Int? {
+        guard let infoList = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: AnyObject]] else {
+            return nil
+        }
+        let count = infoList.filter { info in
+            guard let ownerPID = info[kCGWindowOwnerPID as String] as? pid_t, ownerPID == pid else { return false }
+            // Layer 0 is where normal document/app windows live; anything else is
+            // menus, tooltips, panels, the Dock, etc.
+            guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0 else { return false }
+            return true
+        }.count
+        return count
+    }
+
+    // When any regular app has a true-fullscreen window, macOS gives it a dedicated
+    // Space, which is an extra, cheaper signal of "something unusual is going on"
+    // on top of the cross-check above.
+    private func isSystemInFullscreenTransition() -> Bool {
+        guard let front = NSWorkspace.shared.frontmostApplication else { return false }
+        let axApp = AXUIElementCreateApplication(front.processIdentifier)
+        var windowsValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsValue) == .success,
+              let windows = windowsValue as? [AXUIElement] else {
+            return false
+        }
+        for win in windows {
+            var fsValue: AnyObject?
+            // "AXFullScreen" is an unofficial but widely relied-upon attribute
+            // (used by e.g. Rectangle) exposed by AppKit windows in fullscreen.
+            if AXUIElementCopyAttributeValue(win, "AXFullScreen" as CFString, &fsValue) == .success,
+               let isFullscreen = fsValue as? Bool, isFullscreen {
+                return true
+            }
+        }
+        return false
+    }
+
     private func tick() {
         guard let state = appState, !state.isPaused, state.isAccessibilityGranted else { return }
 
@@ -201,6 +247,8 @@ class AutoQuitMonitor {
         everHadWindow = everHadWindow.filter { currentPIDs.contains($0) }
         zeroWindowSince = zeroWindowSince.filter { currentPIDs.contains($0.key) }
 
+        let systemInFullscreen = isSystemInFullscreenTransition()
+
         for app in runningApps {
             guard let bundleID = app.bundleIdentifier else { continue }
 
@@ -209,12 +257,31 @@ class AutoQuitMonitor {
 
             if !shouldMonitor { continue }
 
-            let count = countWindows(for: app.processIdentifier)
+            // If we couldn't reliably read the window count this tick (AX call failed
+            // or timed out — common when the system is under heavy load, e.g. a
+            // fullscreen game), skip this app entirely rather than guessing it has 0
+            // windows. Guessing wrong here is what caused unrelated apps to be
+            // auto-quit while Roblox was running fullscreen.
+            guard let count = countWindows(for: app.processIdentifier) else { continue }
 
             if count > 0 {
                 everHadWindow.insert(app.processIdentifier)
                 zeroWindowSince.removeValue(forKey: app.processIdentifier)
             } else if count == 0 && everHadWindow.contains(app.processIdentifier) {
+                // Don't trust AX's "0" on its own — cross-check with the WindowServer
+                // directly. If they disagree (CGWindowList still sees a window, or
+                // its own query failed), something unreliable is going on — a
+                // fullscreen game of any kind, heavy system load, a Chromium AX
+                // quirk, etc. Freeze the countdown rather than guess. This is what
+                // actually caused Brave (and could cause other apps) to be wrongly
+                // auto-quit while Roblox was running fullscreen.
+                guard cgWindowCount(for: app.processIdentifier) == 0 else { continue }
+
+                if systemInFullscreen {
+                    // Extra belt-and-suspenders pause for the true-fullscreen-Space
+                    // case specifically, on top of the cross-check above.
+                    continue
+                }
                 if let firstZeroTime = zeroWindowSince[app.processIdentifier] {
                     if Date().timeIntervalSince(firstZeroTime) >= state.delaySeconds {
                         let pid = app.processIdentifier
@@ -242,13 +309,17 @@ class AutoQuitMonitor {
         }
     }
 
-    private func countWindows(for pid: pid_t) -> Int {
+    // Returns nil when the AX call itself failed/timed out (system busy, e.g. a
+    // fullscreen game hogging the GPU) — this is NOT the same as "0 windows" and
+    // must never be treated as the app having closed its last window. Callers
+    // should skip the app entirely for this tick when this returns nil.
+    private func countWindows(for pid: pid_t) -> Int? {
         let axApp = AXUIElementCreateApplication(pid)
         var windowsValue: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsValue)
 
         guard result == .success, let windows = windowsValue as? [AXUIElement] else {
-            return 0
+            return nil
         }
 
         var visibleCount = 0
