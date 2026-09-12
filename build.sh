@@ -25,11 +25,8 @@ else
   echo "==> (Skipping icon: ${APP_NAME}.iconset folder not found)"
 fi
 
-echo "==> 3/4: Code signing (ad-hoc, stable identifier)..."
-# Sign with a fixed --identifier so the signature stays stable across rebuilds,
-# preventing macOS from treating previously-granted Accessibility permission as
-# belonging to "a different app" after every rebuild.
-codesign --force --deep --sign - --identifier "${BUNDLE_ID}" "${APP_BUNDLE}"
+echo "==> 3/4: Code signing (using local dev certificate)..."
+codesign --force --deep --sign "TrueClose Dev Cert" --identifier "${BUNDLE_ID}" "${APP_BUNDLE}"
 
 echo "==> 4/4: Done."
 echo ""
