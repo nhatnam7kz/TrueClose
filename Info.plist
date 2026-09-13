@@ -17,11 +17,11 @@
 
     <!--Đổi tên phiên bản vd 1.0.x-->
     <key>CFBundleShortVersionString</key>
-    <string>1.0.3</string>
+    <string>1.1.0</string>
 
     <!--Tăng +1 mỗi lần build-->
     <key>CFBundleVersion</key>
-    <string>3</string>
+    <string>4</string>
     
     
     <key>LSMinimumSystemVersion</key>

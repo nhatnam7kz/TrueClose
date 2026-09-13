@@ -3,6 +3,7 @@ import SwiftUI
 import ApplicationServices
 import ServiceManagement
 import UniformTypeIdentifiers
+import CoreGraphics
 
 extension Notification.Name {
     static let autoQuitMenuBarVisibilityChanged = Notification.Name("autoQuitMenuBarVisibilityChanged")
@@ -95,6 +96,15 @@ class AppState: ObservableObject {
 
     @Published var isAccessibilityGranted: Bool = false
 
+    /// Screen Recording permission. Not required for the app's core AX-based monitoring,
+    /// but used as an optional cross-check (see AutoQuitMonitor) to correctly read window
+    /// counts for apps sitting on a Desktop/Space that isn't currently active — a case
+    /// where Accessibility alone reliably (and persistently, not just briefly) reports 0
+    /// windows even though the app's window is still genuinely open elsewhere. Without
+    /// this permission, TrueClose still works, just less reliably when using multiple
+    /// Desktops or Spaces.
+    @Published var isScreenRecordingGranted: Bool = false
+
     /// Which tab is currently selected in the Settings window. Kept here (instead of a local
     /// @State in the View) so AppDelegate can force a tab switch every time the window is
     /// opened, even if the window already existed before.
@@ -121,6 +131,7 @@ class AppState: ObservableObject {
         self.whitelistApps = UserDefaults.standard.stringArray(forKey: "whitelistAppList") ?? []
 
         checkAccessibility()
+        checkScreenRecording()
     }
 
     /// Reads the current Accessibility trust state synchronously. This is always called from
@@ -136,6 +147,37 @@ class AppState: ObservableObject {
     func promptAccessibility() {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
+    }
+
+    /// Reads current Screen Recording trust state without prompting. Safe to call
+    /// frequently (e.g. from the same poll timer used for Accessibility).
+    func checkScreenRecording() {
+        if #available(macOS 11.0, *) {
+            isScreenRecordingGranted = CGPreflightScreenCaptureAccess()
+        } else {
+            // Screen Recording as a distinct TCC-gated permission doesn't exist before
+            // macOS 11; treat it as granted so older systems aren't blocked from the
+            // (better-effort) cross-space check.
+            isScreenRecordingGranted = true
+        }
+    }
+
+    /// Triggers the system's Screen Recording permission prompt on first call. If the
+    /// user has already denied it once, macOS won't re-prompt — this instead opens
+    /// System Settings straight to the right pane, matching promptAccessibility()'s
+    /// role for Accessibility.
+    func promptScreenRecording() {
+        if #available(macOS 11.0, *) {
+            if CGPreflightScreenCaptureAccess() {
+                return
+            }
+            let requested = CGRequestScreenCaptureAccess()
+            if !requested {
+                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+        }
     }
 
     func configureLaunchAtLogin(_ enabled: Bool) {
@@ -240,6 +282,29 @@ class AutoQuitMonitor {
     /// again. See handleWillSleep()/handleDidWake() for why this exists.
     private var isSystemSleeping = false
 
+    /// True during (and for a brief settle period after) an active-Space change — which
+    /// happens whenever an app enters/exits native fullscreen (the green button), among
+    /// other causes (Mission Control, trackpad swipe between Spaces). During this window,
+    /// AX window counts for apps on a different Space than the one just activated can be
+    /// unreliable (WindowServer is still catching up), so auto-quit decisions must be
+    /// paused rather than trusted at face value. See handleActiveSpaceChanged().
+    private var isSpaceTransitioning = false
+    private var spaceSettleTimer: Timer?
+
+    /// Pids that have been observed with an AXFullScreen window at least once and have
+    /// NOT since been confirmed to be back in a normal (non-fullscreen) window state.
+    /// BUG FIX: apps in native fullscreen (green button) live on their own dedicated
+    /// Space. Once that Space isn't the one currently on screen, Accessibility calls for
+    /// that app's windows reliably come back EMPTY — not just briefly during the switch
+    /// animation, but for as long as the user stays away from that Space. A short
+    /// time-based grace period isn't enough to cover this (verified by testing: still
+    /// quit apps after a few seconds away). So instead of a timeout, membership here is
+    /// sticky: once we've seen a pid go fullscreen, its 0-window readings are distrusted
+    /// indefinitely, until we get a reading where we can actually see its windows again
+    /// AND it's no longer flagged fullscreen (i.e. the user switched back to it and it's
+    /// confirmed to be a normal window, not just hidden on another Space).
+    private var knownFullscreenPids: Set<pid_t> = []
+
     init(appState: AppState) {
         self.appState = appState
         NotificationCenter.default.addObserver(
@@ -269,6 +334,21 @@ class AutoQuitMonitor {
             name: NSWorkspace.didWakeNotification,
             object: nil
         )
+
+        // BUG FIX: entering native fullscreen (green button) moves the app onto a brand
+        // new Space. While that transition is happening, other apps (now on a different
+        // Space than the active one) can briefly report 0 windows via Accessibility even
+        // though nothing was actually closed — starting their zero-window countdown and
+        // getting them wrongly auto-quit a moment later. This notification fires exactly
+        // when the active Space changes, regardless of the cause, and is far more
+        // reliable than waiting for AXFullScreen to flip true (which lags behind the
+        // actual transition by the length of the animation).
+        workspaceCenter.addObserver(
+            self,
+            selector: #selector(handleActiveSpaceChanged),
+            name: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil
+        )
     }
 
     @objc private func handleFilterChanged() {
@@ -294,6 +374,29 @@ class AutoQuitMonitor {
         // look "expired" the instant we resume ticking — treat waking up as a fresh start
         // instead of instantly quitting apps based on a stale pre-sleep timestamp.
         zeroWindowSince.removeAll()
+    }
+
+    @objc private func handleActiveSpaceChanged() {
+        // Pause immediately and discard any in-flight "zero window since" timestamps —
+        // same reasoning as the sleep/wake fix: treat the transition as a fresh start
+        // rather than risk acting on a count taken mid-transition.
+        isSpaceTransitioning = true
+        zeroWindowSince.removeAll()
+
+        // Give the transition animation (and WindowServer) time to fully settle before
+        // trusting AX window counts again. BUG FIX: 1 second was enough for a plain
+        // fullscreen enter/exit, but NOT enough for creating a brand new Desktop via a
+        // trackpad swipe — that animation (and the WindowServer relayout it triggers)
+        // can run noticeably longer, and apps on the Desktop being left behind were
+        // still misreporting 0 windows after the old 1s buffer expired, causing them to
+        // be wrongly auto-quit. 3 seconds gives real margin for slower transitions.
+        // If another Space change happens before this fires, the wait restarts (see
+        // invalidate() below), so rapid swipes just keep extending the pause safely.
+        spaceSettleTimer?.invalidate()
+        spaceSettleTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
+            self?.isSpaceTransitioning = false
+            self?.zeroWindowSince.removeAll()
+        }
     }
 
     func start() {
@@ -369,13 +472,14 @@ class AutoQuitMonitor {
     }
 
     private func tick() {
-        guard let state = appState, !state.isPaused, state.isAccessibilityGranted, !isSystemSleeping else {
+        guard let state = appState, !state.isPaused, state.isAccessibilityGranted,
+              !isSystemSleeping, !isSpaceTransitioning else {
             // BUG FIX: log the blocked reason only once per blocked stretch, not on every
             // 0.8s tick — previously this printed continuously for as long as the app was
             // paused (or missing permission), flooding the Console with an identical line.
             if !hasLoggedBlockedState {
                 hasLoggedBlockedState = true
-                print("[DEBUG] tick() bị chặn — isPaused=\(appState?.isPaused ?? true), isAccessibilityGranted=\(appState?.isAccessibilityGranted ?? false), isSystemSleeping=\(isSystemSleeping)")
+                print("[DEBUG] tick() bị chặn — isPaused=\(appState?.isPaused ?? true), isAccessibilityGranted=\(appState?.isAccessibilityGranted ?? false), isSystemSleeping=\(isSystemSleeping), isSpaceTransitioning=\(isSpaceTransitioning)")
             }
             return
         }
@@ -391,6 +495,7 @@ class AutoQuitMonitor {
         everHadWindow = everHadWindow.filter { currentPIDs.contains($0) }
         zeroWindowSince = zeroWindowSince.filter { currentPIDs.contains($0.key) }
         wasMonitored = wasMonitored.filter { currentPIDs.contains($0) }
+        knownFullscreenPids = knownFullscreenPids.filter { currentPIDs.contains($0) }
 
         let systemInFullscreen = isSystemInFullscreenTransition()
         if systemInFullscreen {
@@ -426,9 +531,21 @@ class AutoQuitMonitor {
             // fullscreen game), skip this app entirely rather than guessing it has 0
             // windows. Guessing wrong here is what caused unrelated apps to be
             // auto-quit while Roblox was running fullscreen.
-            guard let count = countWindows(for: pid) else {
+            guard let info = countWindows(for: pid) else {
                 print("[DEBUG] \(app.localizedName ?? bundleID): countWindows trả về nil (AX call thất bại)")
                 continue
+            }
+            let count = info.visibleCount
+            if count > 0 {
+                // We can actually see this app's window(s) right now, so trust what we
+                // see: mark it fullscreen if it is, or clear the sticky flag if it's
+                // confirmed back to a normal window — this is the ONLY place the flag
+                // gets cleared, precisely because it's the only moment we have real data.
+                if info.isFullscreen {
+                    knownFullscreenPids.insert(pid)
+                } else {
+                    knownFullscreenPids.remove(pid)
+                }
             }
 
             if count > 0 {
@@ -441,6 +558,24 @@ class AutoQuitMonitor {
                     // cause other apps) to be wrongly auto-quit while Roblox was
                     // fullscreen. No Screen Recording permission needed for this
                     // check, unlike the CGWindowList approach we tried before.
+                    continue
+                }
+                // BUG FIX: an app we've ever seen go native-fullscreen lives on its own
+                // Space. Once that Space isn't the one on screen, AX reliably reports 0
+                // windows for it — not a transient glitch, but for as long as the user
+                // stays away. Don't trust a 0 count for such an app until we've actually
+                // seen it again with a real (non-fullscreen) window, which is the only
+                // way we can be sure it wasn't just hidden on another Space.
+                if knownFullscreenPids.contains(pid) {
+                    continue
+                }
+                // BUG FIX: AX alone reports 0 windows persistently for apps sitting on a
+                // Desktop/Space other than the currently active one — not a transient
+                // glitch, so no timer/settle window fixes it. Cross-check with
+                // CGWindowList, which can see windows across ALL Spaces, before trusting
+                // the zero. Gated on Screen Recording permission since the check isn't
+                // trustworthy without it (falls back to the old AX-only behavior).
+                if state.isScreenRecordingGranted, hasAnyWindowCrossSpace(for: pid) {
                     continue
                 }
                 if let firstZeroTime = zeroWindowSince[pid] {
@@ -470,11 +605,44 @@ class AutoQuitMonitor {
         }
     }
 
+    // Accessibility only reliably reports windows for apps on the CURRENTLY ACTIVE
+    // Desktop/Space — for an app sitting on a different Desktop, AX can report 0
+    // windows persistently, not just briefly, even though the window is still genuinely
+    // open. CGWindowList, unlike AX, enumerates windows across ALL Spaces regardless of
+    // which one is active, so it's used here as a cross-check specifically for the "AX
+    // says 0" case, to avoid confusing "window is on another Desktop" with "window was
+    // actually closed". Requires Screen Recording permission; callers must check
+    // isScreenRecordingGranted before relying on this, since without permission this
+    // call can under-report and isn't safe to trust.
+    private func hasAnyWindowCrossSpace(for pid: pid_t) -> Bool {
+        guard let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else {
+            return false
+        }
+        for info in list {
+            guard let ownerPID = info[kCGWindowOwnerPID as String] as? Int32, ownerPID == pid else { continue }
+            // Layer 0 is where normal app windows live; menu bar items, the Dock, and
+            // other system chrome sit at other layers and would otherwise cause false
+            // positives (an app could look "open" purely because of an invisible helper
+            // window it keeps around).
+            guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0 else { continue }
+            // Skip degenerate/near-zero-size windows some apps keep around invisibly.
+            if let bounds = info[kCGWindowBounds as String] as? [String: CGFloat],
+               let width = bounds["Width"], let height = bounds["Height"],
+               width <= 1 || height <= 1 {
+                continue
+            }
+            return true
+        }
+        return false
+    }
+
     // Returns nil when the AX call itself failed/timed out (system busy, e.g. a
     // fullscreen game hogging the GPU) — this is NOT the same as "0 windows" and
     // must never be treated as the app having closed its last window. Callers
     // should skip the app entirely for this tick when this returns nil.
-    private func countWindows(for pid: pid_t) -> Int? {
+    // Also reports whether any of the app's windows is currently AXFullScreen, reusing
+    // the same AX call already made here rather than issuing a second one just for that.
+    private func countWindows(for pid: pid_t) -> (visibleCount: Int, isFullscreen: Bool)? {
         let axApp = AXUIElementCreateApplication(pid)
         // Same reasoning as isSystemInFullscreenTransition(): bound the call so a hung/busy
         // target app can't stall this monitor's tick indefinitely.
@@ -487,7 +655,14 @@ class AutoQuitMonitor {
         }
 
         var visibleCount = 0
+        var isFullscreen = false
         for win in windows {
+            var fsValue: AnyObject?
+            if AXUIElementCopyAttributeValue(win, "AXFullScreen" as CFString, &fsValue) == .success,
+               let fs = fsValue as? Bool, fs {
+                isFullscreen = true
+            }
+
             var role: AnyObject?
             guard AXUIElementCopyAttributeValue(win, kAXRoleAttribute as CFString, &role) == .success,
                   let roleStr = role as? String, roleStr == (kAXWindowRole as String) else {
@@ -500,7 +675,7 @@ class AutoQuitMonitor {
             // "open" here and do not push the app toward auto-quit.
             visibleCount += 1
         }
-        return visibleCount
+        return (visibleCount, isFullscreen)
     }
 }
 
@@ -691,6 +866,31 @@ struct SettingsView: View {
                     .font(.caption2)
                     .foregroundColor(.secondary)
             }
+
+            Divider()
+
+            VStack(spacing: 8) {
+                HStack(spacing: 8) {
+                    Image(systemName: appState.isScreenRecordingGranted ? "checkmark.circle.fill" : "info.circle.fill")
+                        .foregroundColor(appState.isScreenRecordingGranted ? .green : .secondary)
+                    Text("Screen Recording (optional)")
+                        .font(.subheadline)
+                        .bold()
+                }
+
+                Text("Not required, but improves reliability when you use multiple Desktops/Spaces — without it, an app sitting on a Desktop you're not currently viewing can occasionally be quit by mistake.")
+                    .multilineTextAlignment(.center)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                if !appState.isScreenRecordingGranted {
+                    Button("Grant Screen Recording permission") {
+                        appState.promptScreenRecording()
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+
             Spacer()
         }
     }
@@ -722,6 +922,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // switching back to TrueClose first (didBecomeActiveNotification would not fire then).
         accessibilityPollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.appState.checkAccessibility()
+            self?.appState.checkScreenRecording()
             self?.updateStatusItemVisibility()
         }
 
@@ -732,6 +933,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func handleAppDidBecomeActive() {
         appState.checkAccessibility()
+        appState.checkScreenRecording()
         updateStatusItemVisibility()
     }
 
