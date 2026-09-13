@@ -2,6 +2,7 @@
 .build/
 TrueClose.app/
 TrueClose.dmg
+TrueClose.pkg
 
 # Xcode / SPM rác
 .swiftpm/

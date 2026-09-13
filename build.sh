@@ -28,9 +28,17 @@ fi
 echo "==> 3/4: Code signing (using local dev certificate)..."
 codesign --force --deep --sign "TrueClose Dev Cert" --identifier "${BUNDLE_ID}" "${APP_BUNDLE}"
 
-echo "==> 4/4: Done."
+echo "==> 4/4: Packaging (.dmg and .pkg)..."
+./make_dmg.sh
+./make_pkg.sh
+
 echo ""
-echo "App created at: $(pwd)/${APP_BUNDLE}"
-echo "Copy it into /Applications and open it:"
+echo "==> Done."
+echo ""
+echo "App bundle: $(pwd)/${APP_BUNDLE}"
+echo "DMG:        $(pwd)/${APP_NAME}.dmg"
+echo "PKG:        $(pwd)/${APP_NAME}.pkg"
+echo ""
+echo "To install locally right now:"
 echo "  cp -R ${APP_BUNDLE} /Applications/"
 echo "  open /Applications/${APP_BUNDLE}"
