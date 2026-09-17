@@ -112,8 +112,13 @@ class AppState: ObservableObject {
         checkScreenRecording()
     }
 
+    // OPTIMIZED: chỉ ghi/publish khi giá trị thực sự đổi, tránh trigger lại
+    // toàn bộ layout của SwiftUI (AttributeGraph) mỗi 2 giây một cách vô ích.
     func checkAccessibility() {
-        isAccessibilityGranted = AXIsProcessTrusted()
+        let granted = AXIsProcessTrusted()
+        if granted != isAccessibilityGranted {
+            isAccessibilityGranted = granted
+        }
     }
 
     func promptAccessibility() {
@@ -121,11 +126,17 @@ class AppState: ObservableObject {
         _ = AXIsProcessTrustedWithOptions(options)
     }
 
+    // OPTIMIZED: tương tự checkAccessibility(), chỉ publish khi có thay đổi thật.
     func checkScreenRecording() {
         if #available(macOS 11.0, *) {
-            isScreenRecordingGranted = CGPreflightScreenCaptureAccess()
+            let granted = CGPreflightScreenCaptureAccess()
+            if granted != isScreenRecordingGranted {
+                isScreenRecordingGranted = granted
+            }
         } else {
-            isScreenRecordingGranted = true
+            if !isScreenRecordingGranted {
+                isScreenRecordingGranted = true
+            }
         }
     }
 
@@ -233,6 +244,17 @@ class AutoQuitMonitor {
         let app: NSRunningApplication
     }
     private var appCache: [pid_t: CachedApp] = [:]
+    // FIX: NSKeyValueObservation chỉ giữ WEAK reference tới object được
+    // quan sát (observed object) — nó không tự retain giúp mình. Vì
+    // registerApp() gọi .observe() cho MỌI app đang chạy (không chỉ app
+    // .regular được lưu vào appCache), các app nền/agent (.accessory,
+    // .prohibited) không có nơi nào strong-ref chúng nữa và có thể bị
+    // giải phóng ngay trong khi KVO vẫn đang theo dõi — đây chính là
+    // nguyên nhân của cảnh báo "being deallocated while observers are
+    // still registered", xảy ra ngay lúc khởi động chứ không phải lúc
+    // thoát app. observedApps giữ strong reference cho MỌI app đang được
+    // observe, độc lập với appCache.
+    private var observedApps: [pid_t: NSRunningApplication] = [:]
     private var policyObservers: [pid_t: NSKeyValueObservation] = [:]
 
     // MARK: - FIX B: background scan queue
@@ -282,6 +304,7 @@ class AutoQuitMonitor {
         guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
         let pid = app.processIdentifier
         policyObservers.removeValue(forKey: pid)?.invalidate()
+        observedApps.removeValue(forKey: pid)
         appCache.removeValue(forKey: pid)
         everHadWindow.remove(pid)
         zeroWindowSince.removeValue(forKey: pid)
@@ -292,7 +315,11 @@ class AutoQuitMonitor {
 
     private func registerApp(_ app: NSRunningApplication) {
         let pid = app.processIdentifier
-        guard policyObservers[pid] == nil else { return } 
+        guard policyObservers[pid] == nil else { return }
+
+        // Phải giữ strong reference TRƯỚC khi gọi .observe(), vì bản thân
+        // token KVO không làm việc đó (xem giải thích ở khai báo observedApps).
+        observedApps[pid] = app
 
         applyPolicySnapshot(app)
 
@@ -343,9 +370,20 @@ class AutoQuitMonitor {
         }
         RunLoop.main.add(timer!, forMode: .common)
 
+        // OPTIMIZED: trước đây timer này luôn chạy 2.5s/lần bất kể có cần hay
+        // không, và mỗi lần chạy lại tốn nhiều round-trip XPC đồng bộ
+        // (bundleIdentifier / localizedName) cho MỌI cửa sổ đang mở trên máy.
+        // Thực ra dữ liệu cross-space chỉ có ý nghĩa khi có app đang được
+        // theo dõi và hiện tại có 0 cửa sổ AX-visible (tức đang trong thời
+        // gian chờ để bị auto-quit) VÀ đã được cấp quyền Screen Recording.
+        // Nếu không rơi vào tình huống đó thì bỏ qua, tiết kiệm rất nhiều
+        // syscall mà không ảnh hưởng tính năng.
         if #available(macOS 12.3, *) {
             scKitTimer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: true) { [weak self] _ in
-                self?.refreshShareableContentCache()
+                guard let self, let state = self.appState,
+                      state.isScreenRecordingGranted,
+                      !self.zeroWindowSince.isEmpty else { return }
+                self.refreshShareableContentCache()
             }
             RunLoop.main.add(scKitTimer!, forMode: .common)
         }
@@ -373,10 +411,19 @@ class AutoQuitMonitor {
         let scKitSnapshot = pidsWithRealWindowAnywhere
         let knownWindowIDsSnapshot = knownWindowIDs
 
+        // OPTIMIZED: đã bỏ check `cached.app.isTerminated` ở đây.
+        // appCache đã được đồng bộ chính xác qua các notification
+        // didLaunchApplicationNotification / didTerminateApplicationNotification
+        // (xem handleAppTerminated ở trên), nên check lại isTerminated mỗi
+        // 0.8s cho từng app trên MAIN THREAD là dư thừa — và đây chính là
+        // nguồn gốc phần lớn số lượng syscall/XPC round-trip đồng bộ
+        // (`_LSCopyApplicationInformation`) đo được trong sample. Nếu app
+        // vừa terminate đúng lúc và notification chưa kịp tới, AX call ở
+        // bước sau (countWindows) sẽ tự fail an toàn (trả về nil), không
+        // gây crash hay sai lệch hành vi.
         var candidates: [(pid: pid_t, bundleID: String, app: NSRunningApplication)] = []
         candidates.reserveCapacity(appCache.count)
         for (pid, cached) in appCache {
-            guard !cached.app.isTerminated else { continue }
             candidates.append((pid, cached.bundleIdentifier, cached.app))
         }
 
@@ -505,7 +552,17 @@ class AutoQuitMonitor {
                     }
                 }
             } else {
+                // OPTIMIZED: đúng lúc một app rơi về 0 cửa sổ (bắt đầu đếm
+                // ngược để auto-quit), chủ động refresh ScreenCaptureKit
+                // cache một lần ngay lập tức, thay vì chỉ trông chờ vào
+                // timer 2.5s định kỳ. Điều này đảm bảo dữ liệu cross-space
+                // luôn "tươi" đúng lúc cần quyết định, tránh trường hợp
+                // quit nhầm app đang nằm ở Space khác do cache cũ/rỗng —
+                // tức là vừa tối ưu vừa đúng (hoặc đúng hơn) so với bản gốc.
                 zeroWindowSince[pid] = Date()
+                if #available(macOS 12.3, *), appState?.isScreenRecordingGranted == true {
+                    refreshShareableContentCache()
+                }
             }
         }
     }
@@ -573,6 +630,34 @@ class AutoQuitMonitor {
                 print("[DEBUG] ScreenCaptureKit refresh failed: \(error)")
             }
         }
+    }
+
+    // FIX: dọn dẹp tường minh khi app thoát. Trước đây không có hàm này —
+    // các NSKeyValueObservation trong policyObservers chỉ được invalidate
+    // theo từng pid khi app KHÁC bị đóng (handleAppTerminated), không có
+    // bước nào chạy khi CHÍNH TrueClose thoát. Lúc process kết thúc, thứ
+    // tự giải phóng giữa AutoQuitMonitor và các NSRunningApplication đang
+    // bị observe là không xác định, dẫn tới cảnh báo/crash "being
+    // deallocated while observers are still registered". Gọi stop() từ
+    // applicationWillTerminate đảm bảo mọi observation được invalidate
+    // trong khi mọi thứ vẫn còn sống, trước khi process bắt đầu teardown.
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+        scKitTimer?.invalidate()
+        scKitTimer = nil
+        spaceSettleTimer?.invalidate()
+        spaceSettleTimer = nil
+
+        NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+
+        for (_, observer) in policyObservers {
+            observer.invalidate()
+        }
+        policyObservers.removeAll()
+        observedApps.removeAll()
+        appCache.removeAll()
     }
 
     private func hasAnyWindowCrossSpace(for pid: pid_t, knownIDs: Set<CGWindowID>) -> Bool {
@@ -830,12 +915,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.addObserver(self, selector: #selector(menuBarVisibilityChanged), name: .autoQuitMenuBarVisibilityChanged, object: nil)
 
         accessibilityPollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            self?.appState.checkAccessibility()
-            self?.appState.checkScreenRecording()
-            self?.updateStatusItemVisibility()
+            guard let self else { return }
+            self.appState.checkAccessibility()
+            // OPTIMIZED: sample thực tế cho thấy checkScreenRecording()
+            // chiếm gần như toàn bộ thời gian của timer này — mỗi lần gọi
+            // là một round-trip XPC đồng bộ tới tccd (TCCAccessCheck),
+            // chặn main thread, lặp lại mỗi 2s vĩnh viễn. Quyền Screen
+            // Recording hầu như không tự mất khi app đang chạy, nên một
+            // khi đã được cấp, không cần poll lại nữa — nếu nó có bị thu
+            // hồi, các lệnh gọi ScreenCaptureKit liên quan đã có try/catch
+            // nên tự fail an toàn (xem refreshShareableContentCache()).
+            if !self.appState.isScreenRecordingGranted {
+                self.appState.checkScreenRecording()
+            }
+            self.updateStatusItemVisibility()
         }
 
         registerGlobalSettingsShortcut()
+    }
+
+    // FIX: dọn dẹp tường minh khi app thoát, thay vì để mặc cho thứ tự
+    // dealloc ngẫu nhiên lúc process kết thúc — đây là nguyên nhân gây ra
+    // cảnh báo "being deallocated while observers are still registered".
+    func applicationWillTerminate(_ notification: Notification) {
+        monitor.stop()
+        accessibilityPollTimer?.invalidate()
+        accessibilityPollTimer = nil
+        if let eventMonitor = eventMonitor {
+            NSEvent.removeMonitor(eventMonitor)
+            self.eventMonitor = nil
+        }
     }
 
     @objc func handleAppDidBecomeActive() {
