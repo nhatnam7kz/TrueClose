@@ -8,11 +8,10 @@ import ScreenCaptureKit
 
 extension Notification.Name {
     static let autoQuitMenuBarVisibilityChanged = Notification.Name("autoQuitMenuBarVisibilityChanged")
+    static let autoQuitFilterChanged = Notification.Name("autoQuitFilterChanged")
 }
 
-// Undocumented but long-stable private API (used by many menu-bar utilities — Rectangle,
-// AltTab, Contexts, etc. — for over a decade, still present on current macOS) that maps an
-// AXUIElement window to its CGWindowID.
+// Undocumented but long-stable private API
 @_silgen_name("_AXUIElementGetWindow")
 func _AXUIElementGetWindow(_ element: AXUIElement, _ identifier: UnsafeMutablePointer<CGWindowID>) -> AXError
 
@@ -22,12 +21,11 @@ enum FilterMode: String {
     case whitelist
 }
 
-/// Reads app metadata (like the version shown in Settings)
+/// Reads app metadata
 enum AppInfo {
     static var version: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
     }
-
     static var build: String {
         Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
     }
@@ -208,14 +206,12 @@ class AppState: ObservableObject {
     }
 }
 
-extension Notification.Name {
-    static let autoQuitFilterChanged = Notification.Name("autoQuitFilterChanged")
-}
-
-// MARK: - Window-tracking logic
+// MARK: - Window-tracking logic (Optimized)
 class AutoQuitMonitor {
     private weak var appState: AppState?
     private var timer: Timer?
+    private var scKitTimer: Timer?
+
     private var everHadWindow: Set<pid_t> = []
     private var zeroWindowSince: [pid_t: Date] = [:]
     private var wasMonitored: Set<pid_t> = []
@@ -230,14 +226,92 @@ class AutoQuitMonitor {
     private var pidsWithRealWindowAnywhere: Set<pid_t> = []
     private var isRefreshingShareableContent = false
 
+    // MARK: - FIX A: event-driven pid cache
+
+    private struct CachedApp {
+        let bundleIdentifier: String
+        let app: NSRunningApplication
+    }
+    private var appCache: [pid_t: CachedApp] = [:]
+    private var policyObservers: [pid_t: NSKeyValueObservation] = [:]
+
+    // MARK: - FIX B: background scan queue
+
+    private let scanQueue = DispatchQueue(label: "com.trueclose.ax-scan", qos: .userInitiated)
+    private var isTicking = false
+
+    private struct TickResult {
+        let pid: pid_t
+        let count: Int
+        let isFullscreen: Bool
+        let windowIDs: Set<CGWindowID>
+        let crossSpaceAlive: Bool?
+    }
+
     init(appState: AppState) {
         self.appState = appState
         NotificationCenter.default.addObserver(self, selector: #selector(handleFilterChanged), name: .autoQuitFilterChanged, object: nil)
-        
+
         let workspaceCenter = NSWorkspace.shared.notificationCenter
         workspaceCenter.addObserver(self, selector: #selector(handleWillSleep), name: NSWorkspace.willSleepNotification, object: nil)
         workspaceCenter.addObserver(self, selector: #selector(handleDidWake), name: NSWorkspace.didWakeNotification, object: nil)
         workspaceCenter.addObserver(self, selector: #selector(handleActiveSpaceChanged), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
+        workspaceCenter.addObserver(self, selector: #selector(handleAppLaunched(_:)), name: NSWorkspace.didLaunchApplicationNotification, object: nil)
+        workspaceCenter.addObserver(self, selector: #selector(handleAppTerminated(_:)), name: NSWorkspace.didTerminateApplicationNotification, object: nil)
+
+        warmUpAppCache()
+    }
+
+    // MARK: - Cache lifecycle
+
+    private func warmUpAppCache() {
+        let currentPID = ProcessInfo.processInfo.processIdentifier
+        for app in NSWorkspace.shared.runningApplications {
+            guard app.processIdentifier != currentPID, !app.isTerminated else { continue }
+            registerApp(app)
+        }
+    }
+
+    @objc private func handleAppLaunched(_ notification: Notification) {
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+              app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
+        registerApp(app)
+    }
+
+    @objc private func handleAppTerminated(_ notification: Notification) {
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+        let pid = app.processIdentifier
+        policyObservers.removeValue(forKey: pid)?.invalidate()
+        appCache.removeValue(forKey: pid)
+        everHadWindow.remove(pid)
+        zeroWindowSince.removeValue(forKey: pid)
+        wasMonitored.remove(pid)
+        knownFullscreenPids.remove(pid)
+        knownWindowIDs.removeValue(forKey: pid)
+    }
+
+    private func registerApp(_ app: NSRunningApplication) {
+        let pid = app.processIdentifier
+        guard policyObservers[pid] == nil else { return } 
+
+        applyPolicySnapshot(app)
+
+        policyObservers[pid] = app.observe(\.activationPolicy, options: [.new]) { [weak self] app, _ in
+            DispatchQueue.main.async {
+                self?.applyPolicySnapshot(app)
+            }
+        }
+    }
+
+    private func applyPolicySnapshot(_ app: NSRunningApplication) {
+        let pid = app.processIdentifier
+        if app.activationPolicy == .regular, let bundleID = app.bundleIdentifier {
+            appCache[pid] = CachedApp(bundleIdentifier: bundleID, app: app)
+        } else {
+            appCache.removeValue(forKey: pid)
+            wasMonitored.remove(pid)
+            zeroWindowSince.removeValue(forKey: pid)
+        }
     }
 
     @objc private func handleFilterChanged() {
@@ -265,9 +339,213 @@ class AutoQuitMonitor {
 
     func start() {
         timer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] _ in
-            self?.tick()
+            self?.scheduleTick()
         }
         RunLoop.main.add(timer!, forMode: .common)
+
+        if #available(macOS 12.3, *) {
+            scKitTimer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: true) { [weak self] _ in
+                self?.refreshShareableContentCache()
+            }
+            RunLoop.main.add(scKitTimer!, forMode: .common)
+        }
+    }
+
+    // MARK: - Tick scheduling 
+
+    private func scheduleTick() {
+        guard let state = appState, !state.isPaused, state.isAccessibilityGranted,
+              !isSystemSleeping, !isSpaceTransitioning else {
+            if !hasLoggedBlockedState {
+                hasLoggedBlockedState = true
+            }
+            return
+        }
+        hasLoggedBlockedState = false
+
+        guard !isTicking else { return }
+        isTicking = true
+
+        let filterMode = state.filterMode
+        let appList = Set(state.appList)
+        let delaySeconds = state.delaySeconds
+        let screenRecordingGranted = state.isScreenRecordingGranted
+        let scKitSnapshot = pidsWithRealWindowAnywhere
+        let knownWindowIDsSnapshot = knownWindowIDs
+
+        var candidates: [(pid: pid_t, bundleID: String, app: NSRunningApplication)] = []
+        candidates.reserveCapacity(appCache.count)
+        for (pid, cached) in appCache {
+            guard !cached.app.isTerminated else { continue }
+            candidates.append((pid, cached.bundleIdentifier, cached.app))
+        }
+
+        scanQueue.async { [weak self] in
+            self?.performBackgroundTick(
+                candidates: candidates,
+                filterMode: filterMode,
+                appList: appList,
+                delaySeconds: delaySeconds,
+                screenRecordingGranted: screenRecordingGranted,
+                scKitSnapshot: scKitSnapshot,
+                knownWindowIDsSnapshot: knownWindowIDsSnapshot
+            )
+        }
+    }
+
+    // MARK: - Background work 
+
+    private func performBackgroundTick(
+        candidates: [(pid: pid_t, bundleID: String, app: NSRunningApplication)],
+        filterMode: FilterMode,
+        appList: Set<String>,
+        delaySeconds: Double,
+        screenRecordingGranted: Bool,
+        scKitSnapshot: Set<pid_t>,
+        knownWindowIDsSnapshot: [pid_t: Set<CGWindowID>]
+    ) {
+        defer {
+            DispatchQueue.main.async { [weak self] in
+                self?.isTicking = false
+            }
+        }
+
+        let systemInFullscreen = isSystemInFullscreenTransition()
+        var results: [TickResult] = []
+        results.reserveCapacity(candidates.count)
+        var monitoredPids: Set<pid_t> = []
+
+        for c in candidates {
+            let isListed = appList.contains(c.bundleID)
+            let shouldMonitor = (filterMode == .blacklist) ? !isListed : isListed
+            guard shouldMonitor else { continue }
+            monitoredPids.insert(c.pid)
+
+            guard let info = countWindows(for: c.pid) else { continue }
+
+            var crossSpaceAlive: Bool? = nil
+            if info.visibleCount == 0 && screenRecordingGranted {
+                if #available(macOS 12.3, *) {
+                    crossSpaceAlive = scKitSnapshot.contains(c.pid)
+                } else {
+                    crossSpaceAlive = hasAnyWindowCrossSpace(for: c.pid, knownIDs: knownWindowIDsSnapshot[c.pid] ?? [])
+                }
+            }
+
+            results.append(TickResult(
+                pid: c.pid,
+                count: info.visibleCount,
+                isFullscreen: info.isFullscreen,
+                windowIDs: info.windowIDs,
+                crossSpaceAlive: crossSpaceAlive
+            ))
+        }
+
+        DispatchQueue.main.async { [weak self] in
+            self?.applyTickResults(results, monitoredPids: monitoredPids, systemInFullscreen: systemInFullscreen, delaySeconds: delaySeconds)
+        }
+    }
+
+    // MARK: - Apply results on main 
+
+    private func applyTickResults(_ results: [TickResult], monitoredPids: Set<pid_t>, systemInFullscreen: Bool, delaySeconds: Double) {
+        for pid in monitoredPids where !wasMonitored.contains(pid) {
+            zeroWindowSince.removeValue(forKey: pid)
+        }
+        
+        let noLongerMonitored = wasMonitored.subtracting(monitoredPids)
+        wasMonitored.subtract(noLongerMonitored)
+        wasMonitored.formUnion(monitoredPids)
+
+        for r in results {
+            let pid = r.pid
+            let count = r.count
+
+            if count > 0 {
+                if r.isFullscreen {
+                    knownFullscreenPids.insert(pid)
+                } else {
+                    knownFullscreenPids.remove(pid)
+                }
+                if !r.windowIDs.isEmpty {
+                    knownWindowIDs[pid, default: []].formUnion(r.windowIDs)
+                }
+                everHadWindow.insert(pid)
+                zeroWindowSince.removeValue(forKey: pid)
+                continue
+            }
+
+            guard everHadWindow.contains(pid) else { continue }
+            if systemInFullscreen { continue }
+            if knownFullscreenPids.contains(pid) { continue }
+
+            if let crossSpaceAlive = r.crossSpaceAlive, crossSpaceAlive {
+                let axApp = AXUIElementCreateApplication(pid)
+                var mainWindow: CFTypeRef?
+                let result = AXUIElementCopyAttributeValue(axApp, kAXMainWindowAttribute as CFString, &mainWindow)
+                if result == .success && mainWindow != nil {
+                    continue
+                }
+            }
+
+            guard let app = appCache[pid]?.app else { continue }
+
+            if let firstZeroTime = zeroWindowSince[pid] {
+                if Date().timeIntervalSince(firstZeroTime) >= delaySeconds {
+                    app.terminate()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                        guard let self else { return }
+                        if app.isTerminated {
+                            self.everHadWindow.remove(pid)
+                            self.zeroWindowSince.removeValue(forKey: pid)
+                            self.knownWindowIDs.removeValue(forKey: pid)
+                        } else {
+                            self.zeroWindowSince[pid] = Date()
+                        }
+                    }
+                }
+            } else {
+                zeroWindowSince[pid] = Date()
+            }
+        }
+    }
+
+    // MARK: - Unchanged Core Logic
+
+    private func isSystemInFullscreenTransition() -> Bool {
+        guard let front = NSWorkspace.shared.frontmostApplication else { return false }
+        let axApp = AXUIElementCreateApplication(front.processIdentifier)
+        AXUIElementSetMessagingTimeout(axApp, 0.3)
+        var windowsValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsValue) == .success,
+              let windows = windowsValue as? [AXUIElement] else {
+            return false
+        }
+
+        let screenSizes = NSScreen.screens.map { $0.frame.size }
+        for win in windows {
+            var fsValue: AnyObject?
+            if AXUIElementCopyAttributeValue(win, "AXFullScreen" as CFString, &fsValue) == .success,
+               let isFullscreen = fsValue as? Bool, isFullscreen {
+                return true
+            }
+
+            var sizeValue: AnyObject?
+            guard AXUIElementCopyAttributeValue(win, kAXSizeAttribute as CFString, &sizeValue) == .success else { continue }
+            guard let sizeAXValue = sizeValue, CFGetTypeID(sizeAXValue) == AXValueGetTypeID() else { continue }
+
+            let axValue = sizeAXValue as! AXValue
+            var windowSize = CGSize.zero
+            if AXValueGetType(axValue) == .cgSize {
+                AXValueGetValue(axValue, .cgSize, &windowSize)
+            } else { continue }
+
+            let tolerance: CGFloat = 2.0
+            if screenSizes.contains(where: {
+                abs($0.width - windowSize.width) < tolerance && abs($0.height - windowSize.height) < tolerance
+            }) { return true }
+        }
+        return false
     }
 
     @available(macOS 12.3, *)
@@ -293,159 +571,6 @@ class AutoQuitMonitor {
                 }
             } catch {
                 print("[DEBUG] ScreenCaptureKit refresh failed: \(error)")
-            }
-        }
-    }
-
-    private func isSystemInFullscreenTransition() -> Bool {
-        guard let front = NSWorkspace.shared.frontmostApplication else { return false }
-        let axApp = AXUIElementCreateApplication(front.processIdentifier)
-        AXUIElementSetMessagingTimeout(axApp, 0.3)
-        var windowsValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsValue) == .success,
-              let windows = windowsValue as? [AXUIElement] else {
-            return false
-        }
-
-        let screenSizes = NSScreen.screens.map { $0.frame.size }
-        for win in windows {
-            var fsValue: AnyObject?
-            if AXUIElementCopyAttributeValue(win, "AXFullScreen" as CFString, &fsValue) == .success,
-               let isFullscreen = fsValue as? Bool, isFullscreen {
-                return true
-            }
-
-            var sizeValue: AnyObject?
-            guard AXUIElementCopyAttributeValue(win, kAXSizeAttribute as CFString, &sizeValue) == .success else { continue }
-            guard let sizeAXValue = sizeValue, CFGetTypeID(sizeAXValue) == AXValueGetTypeID() else { continue }
-            
-            let axValue = sizeAXValue as! AXValue
-            var windowSize = CGSize.zero
-            if AXValueGetType(axValue) == .cgSize {
-                AXValueGetValue(axValue, .cgSize, &windowSize)
-            } else { continue }
-            
-            let tolerance: CGFloat = 2.0
-            if screenSizes.contains(where: {
-                abs($0.width - windowSize.width) < tolerance && abs($0.height - windowSize.height) < tolerance
-            }) { return true }
-        }
-        return false
-    }
-
-    private func tick() {
-        guard let state = appState, !state.isPaused, state.isAccessibilityGranted,
-              !isSystemSleeping, !isSpaceTransitioning else {
-            if !hasLoggedBlockedState {
-                hasLoggedBlockedState = true
-            }
-            return
-        }
-        hasLoggedBlockedState = false
-
-        if #available(macOS 12.3, *), state.isScreenRecordingGranted {
-            refreshShareableContentCache()
-        }
-
-        let runningApps = NSWorkspace.shared.runningApplications.filter {
-            $0.activationPolicy == .regular &&
-            $0.processIdentifier != ProcessInfo.processInfo.processIdentifier &&
-            !$0.isTerminated
-        }
-
-        let currentPIDs = Set(runningApps.map { $0.processIdentifier })
-        everHadWindow = everHadWindow.filter { currentPIDs.contains($0) }
-        zeroWindowSince = zeroWindowSince.filter { currentPIDs.contains($0.key) }
-        wasMonitored = wasMonitored.filter { currentPIDs.contains($0) }
-        knownFullscreenPids = knownFullscreenPids.filter { currentPIDs.contains($0) }
-        knownWindowIDs = knownWindowIDs.filter { currentPIDs.contains($0.key) }
-
-        let systemInFullscreen = isSystemInFullscreenTransition()
-
-        for app in runningApps {
-            guard let bundleID = app.bundleIdentifier else { continue }
-
-            let isListed = state.appList.contains(bundleID)
-            let shouldMonitor = (state.filterMode == .blacklist) ? !isListed : isListed
-            let pid = app.processIdentifier
-
-            if shouldMonitor && !wasMonitored.contains(pid) {
-                zeroWindowSince.removeValue(forKey: pid)
-            }
-
-            if shouldMonitor {
-                wasMonitored.insert(pid)
-            } else {
-                wasMonitored.remove(pid)
-                continue
-            }
-
-            guard let info = countWindows(for: pid) else { continue }
-            let count = info.visibleCount
-            
-            if count > 0 {
-                if info.isFullscreen {
-                    knownFullscreenPids.insert(pid)
-                } else {
-                    knownFullscreenPids.remove(pid)
-                }
-                if !info.windowIDs.isEmpty {
-                    knownWindowIDs[pid, default: []].formUnion(info.windowIDs)
-                }
-            }
-
-            if count > 0 {
-                everHadWindow.insert(pid)
-                zeroWindowSince.removeValue(forKey: pid)
-            } else if count == 0 && everHadWindow.contains(pid) {
-                if systemInFullscreen { continue }
-                if knownFullscreenPids.contains(pid) { continue }
-
-                // BỘ LỌC ĐA MÀN HÌNH VÀ CHỐNG ZOMBIE
-                if state.isScreenRecordingGranted {
-                    var savedByCrossSpace = false
-                    
-                    if #available(macOS 12.3, *) {
-                        if pidsWithRealWindowAnywhere.contains(pid) {
-                            savedByCrossSpace = true
-                        }
-                    } else if hasAnyWindowCrossSpace(for: pid, knownIDs: knownWindowIDs[pid] ?? []) {
-                        savedByCrossSpace = true
-                    }
-                    
-                    if savedByCrossSpace {
-                        // CHỐT CHẶN CUỐI CÙNG BẰNG AXMainWindow
-                        // Bất kỳ app nào (Electron/Native) khi đóng cửa sổ sẽ bị hệ thống tước quyền Main Window
-                        // Cửa sổ sống ở Space khác vẫn giữ nguyên Main Window.
-                        let axApp = AXUIElementCreateApplication(pid)
-                        var mainWindow: CFTypeRef?
-                        let result = AXUIElementCopyAttributeValue(axApp, kAXMainWindowAttribute as CFString, &mainWindow)
-                        
-                        if result == .success && mainWindow != nil {
-                            continue // Thực sự là cửa sổ sống ở Space khác -> Không tắt
-                        }
-                        // Nếu không có mainWindow -> 100% là cửa sổ Zombie -> Kệ cho nó đếm ngược để tắt
-                    }
-                }
-                
-                // Đếm ngược thời gian tắt app
-                if let firstZeroTime = zeroWindowSince[pid] {
-                    if Date().timeIntervalSince(firstZeroTime) >= state.delaySeconds {
-                        app.terminate()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                            guard let self else { return }
-                            if app.isTerminated {
-                                self.everHadWindow.remove(pid)
-                                self.zeroWindowSince.removeValue(forKey: pid)
-                                self.knownWindowIDs.removeValue(forKey: pid)
-                            } else {
-                                self.zeroWindowSince[pid] = Date()
-                            }
-                        }
-                    }
-                } else {
-                    zeroWindowSince[pid] = Date()
-                }
             }
         }
     }
@@ -692,6 +817,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
     var settingsWindow: NSWindow?
     var accessibilityPollTimer: Timer?
+    var eventMonitor: Any? // FIX: Retain event monitor to avoid leak
     let appState = AppState()
     lazy var monitor = AutoQuitMonitor(appState: appState)
 
@@ -723,10 +849,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func registerGlobalSettingsShortcut() {
-        NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        if let existing = eventMonitor {
+            NSEvent.removeMonitor(existing)
+        }
+        eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
             if event.modifierFlags.contains([.option, .shift]) && event.charactersIgnoringModifiers?.lowercased() == "a" {
                 DispatchQueue.main.async { self?.openSettings() }
             }
+        }
+    }
+
+    deinit {
+        if let monitor = eventMonitor {
+            NSEvent.removeMonitor(monitor)
         }
     }
 
