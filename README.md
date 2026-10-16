@@ -12,7 +12,7 @@
 [![Homebrew](https://img.shields.io/badge/brew-nhatnam7kz%2Ftap-orange?style=flat-square)](#install)
 [![GitHub stars](https://img.shields.io/github/stars/nhatnam7kz/TrueClose?style=flat-square)](https://github.com/nhatnam7kz/TrueClose/stargazers)
 [![GitHub forks](https://img.shields.io/github/forks/nhatnam7kz/TrueClose?style=flat-square)](https://github.com/nhatnam7kz/TrueClose/network/members)
-[![License](https://img.shields.io/github/license/nhatnam7kz/TrueClose?style=flat-square)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 </div>
 
