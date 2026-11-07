@@ -229,6 +229,11 @@ class AutoQuitMonitor {
 
     private var hasLoggedBlockedState = false
     private var isSystemSleeping = false
+    // While the screen is locked (including the lock that follows display
+    // sleep), AX redacts every app's window list, so every app looks like it
+    // has 0 windows. Monitoring must stay paused for the whole period.
+    private var isScreenLocked = AutoQuitMonitor.isSessionLocked()
+    private var areScreensAsleep = false
     private var isSpaceTransitioning = false
     private var spaceSettleTimer: Timer?
     private var knownFullscreenPids: Set<pid_t> = []
@@ -277,9 +282,15 @@ class AutoQuitMonitor {
         let workspaceCenter = NSWorkspace.shared.notificationCenter
         workspaceCenter.addObserver(self, selector: #selector(handleWillSleep), name: NSWorkspace.willSleepNotification, object: nil)
         workspaceCenter.addObserver(self, selector: #selector(handleDidWake), name: NSWorkspace.didWakeNotification, object: nil)
+        workspaceCenter.addObserver(self, selector: #selector(handleScreensDidSleep), name: NSWorkspace.screensDidSleepNotification, object: nil)
+        workspaceCenter.addObserver(self, selector: #selector(handleScreensDidWake), name: NSWorkspace.screensDidWakeNotification, object: nil)
         workspaceCenter.addObserver(self, selector: #selector(handleActiveSpaceChanged), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
         workspaceCenter.addObserver(self, selector: #selector(handleAppLaunched(_:)), name: NSWorkspace.didLaunchApplicationNotification, object: nil)
         workspaceCenter.addObserver(self, selector: #selector(handleAppTerminated(_:)), name: NSWorkspace.didTerminateApplicationNotification, object: nil)
+
+        let distributedCenter = DistributedNotificationCenter.default()
+        distributedCenter.addObserver(self, selector: #selector(handleScreenLocked), name: Notification.Name("com.apple.screenIsLocked"), object: nil)
+        distributedCenter.addObserver(self, selector: #selector(handleScreenUnlocked), name: Notification.Name("com.apple.screenIsUnlocked"), object: nil)
 
         warmUpAppCache()
     }
@@ -354,6 +365,35 @@ class AutoQuitMonitor {
         zeroWindowSince.removeAll()
     }
 
+    @objc private func handleScreensDidSleep() {
+        areScreensAsleep = true
+        zeroWindowSince.removeAll()
+    }
+
+    @objc private func handleScreensDidWake() {
+        areScreensAsleep = false
+        zeroWindowSince.removeAll()
+    }
+
+    @objc private func handleScreenLocked() {
+        isScreenLocked = true
+        zeroWindowSince.removeAll()
+    }
+
+    @objc private func handleScreenUnlocked() {
+        isScreenLocked = false
+        zeroWindowSince.removeAll()
+    }
+
+    private static func isSessionLocked() -> Bool {
+        guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else { return false }
+        return session["CGSSessionScreenIsLocked"] as? Bool ?? false
+    }
+
+    private var isMonitoringSuspended: Bool {
+        isSystemSleeping || isScreenLocked || areScreensAsleep || isSpaceTransitioning
+    }
+
     @objc private func handleActiveSpaceChanged() {
         isSpaceTransitioning = true
         zeroWindowSince.removeAll()
@@ -393,7 +433,7 @@ class AutoQuitMonitor {
 
     private func scheduleTick() {
         guard let state = appState, !state.isPaused, state.isAccessibilityGranted,
-              !isSystemSleeping, !isSpaceTransitioning else {
+              !isMonitoringSuspended else {
             if !hasLoggedBlockedState {
                 hasLoggedBlockedState = true
             }
@@ -496,6 +536,10 @@ class AutoQuitMonitor {
     // MARK: - Apply results on main 
 
     private func applyTickResults(_ results: [TickResult], monitoredPids: Set<pid_t>, systemInFullscreen: Bool, delaySeconds: Double) {
+        // A scan that was in flight when the screen locked/slept may carry
+        // redacted (empty) window lists; drop it instead of acting on it.
+        guard !isMonitoringSuspended else { return }
+
         for pid in monitoredPids where !wasMonitored.contains(pid) {
             zeroWindowSince.removeValue(forKey: pid)
         }
@@ -651,6 +695,7 @@ class AutoQuitMonitor {
 
         NotificationCenter.default.removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+        DistributedNotificationCenter.default().removeObserver(self)
 
         for (_, observer) in policyObservers {
             observer.invalidate()
@@ -696,7 +741,13 @@ class AutoQuitMonitor {
 
             var role: AnyObject?
             guard AXUIElementCopyAttributeValue(win, kAXRoleAttribute as CFString, &role) == .success,
-                  let roleStr = role as? String, roleStr == (kAXWindowRole as String) else { continue }
+                  let roleStr = role as? String else { continue }
+
+            // When the screen is locked, AX redacts the window list: each
+            // window comes back as an AXApplication element. The real window
+            // count is unknown, so report failure rather than 0 windows.
+            if roleStr == (kAXApplicationRole as String) { return nil }
+            guard roleStr == (kAXWindowRole as String) else { continue }
 
             visibleCount += 1
 
