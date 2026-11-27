@@ -15,6 +15,16 @@ extension Notification.Name {
 @_silgen_name("_AXUIElementGetWindow")
 func _AXUIElementGetWindow(_ element: AXUIElement, _ identifier: UnsafeMutablePointer<CGWindowID>) -> AXError
 
+// Private SkyLight Space APIs.
+// They need no Screen Recording permission.
+@_silgen_name("CGSMainConnectionID")
+func CGSMainConnectionID() -> Int32
+@_silgen_name("CGSCopyManagedDisplaySpaces")
+func CGSCopyManagedDisplaySpaces(_ cid: Int32) -> Unmanaged<CFArray>?
+@_silgen_name("CGSCopySpacesForWindows")
+func CGSCopySpacesForWindows(_ cid: Int32, _ mask: Int32, _ windowIDs: CFArray) -> Unmanaged<CFArray>?
+let kCGSAllSpacesMask: Int32 = 7
+
 /// Typed filter mode, backed by a plain String in storage
 enum FilterMode: String {
     case blacklist
@@ -273,6 +283,50 @@ class AutoQuitMonitor {
         let isFullscreen: Bool
         let windowIDs: Set<CGWindowID>
         let crossSpaceAlive: Bool?
+        let hasWindowOnHiddenSpace: Bool
+    }
+
+    // AX only reports windows on the Spaces currently shown, so an app whose
+    // windows are all on another desktop, or behind a fullscreen app, looks
+    // windowless. Ask the window server which Spaces each window is on.
+    // Closed and hidden windows belong to no Space, so they don't count.
+    private struct HiddenSpaceWindows {
+        private let connection = CGSMainConnectionID()
+        private var shownSpaces: Set<UInt64> = []
+        private var windowIDsByPid: [pid_t: [CGWindowID]] = [:]
+
+        init() {
+            guard let displays = CGSCopyManagedDisplaySpaces(connection)?.takeRetainedValue() as? [[String: Any]] else { return }
+            for display in displays {
+                if let current = display["Current Space"] as? [String: Any],
+                   let id = current["id64"] as? NSNumber {
+                    shownSpaces.insert(id.uint64Value)
+                }
+            }
+            // Without the shown Spaces every window would look hidden; stay
+            // with AX's answer instead.
+            guard !shownSpaces.isEmpty,
+                  let list = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return }
+            for info in list {
+                guard let pid = info[kCGWindowOwnerPID as String] as? pid_t,
+                      let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
+                      let number = info[kCGWindowNumber as String] as? Int,
+                      (info[kCGWindowAlpha as String] as? Double ?? 1) > 0,
+                      let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+                      let bounds = CGRect(dictionaryRepresentation: boundsDict),
+                      bounds.width > 1, bounds.height > 1 else { continue }
+                windowIDsByPid[pid, default: []].append(CGWindowID(number))
+            }
+        }
+
+        func hasWindowOnHiddenSpace(_ pid: pid_t) -> Bool {
+            for windowID in windowIDsByPid[pid] ?? [] {
+                guard let spaces = CGSCopySpacesForWindows(connection, kCGSAllSpacesMask, [NSNumber(value: windowID)] as CFArray)?
+                        .takeRetainedValue() as? [NSNumber], !spaces.isEmpty else { continue }
+                if !spaces.contains(where: { shownSpaces.contains($0.uint64Value) }) { return true }
+            }
+            return false
+        }
     }
 
     init(appState: AppState) {
@@ -501,6 +555,7 @@ class AutoQuitMonitor {
         var results: [TickResult] = []
         results.reserveCapacity(candidates.count)
         var monitoredPids: Set<pid_t> = []
+        var hiddenSpaceWindows: HiddenSpaceWindows?
 
         for c in candidates {
             let isListed = appList.contains(c.bundleID)
@@ -509,6 +564,12 @@ class AutoQuitMonitor {
             monitoredPids.insert(c.pid)
 
             guard let info = countWindows(for: c.pid) else { continue }
+
+            var hasWindowOnHiddenSpace = false
+            if info.visibleCount == 0 {
+                if hiddenSpaceWindows == nil { hiddenSpaceWindows = HiddenSpaceWindows() }
+                hasWindowOnHiddenSpace = hiddenSpaceWindows!.hasWindowOnHiddenSpace(c.pid)
+            }
 
             var crossSpaceAlive: Bool? = nil
             if info.visibleCount == 0 && screenRecordingGranted {
@@ -524,7 +585,8 @@ class AutoQuitMonitor {
                 count: info.visibleCount,
                 isFullscreen: info.isFullscreen,
                 windowIDs: info.windowIDs,
-                crossSpaceAlive: crossSpaceAlive
+                crossSpaceAlive: crossSpaceAlive,
+                hasWindowOnHiddenSpace: hasWindowOnHiddenSpace
             ))
         }
 
@@ -567,6 +629,10 @@ class AutoQuitMonitor {
             }
 
             guard everHadWindow.contains(pid) else { continue }
+            if r.hasWindowOnHiddenSpace {
+                zeroWindowSince.removeValue(forKey: pid)
+                continue
+            }
             if systemInFullscreen { continue }
             if knownFullscreenPids.contains(pid) { continue }
 
