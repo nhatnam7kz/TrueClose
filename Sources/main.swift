@@ -615,11 +615,16 @@ class AutoQuitMonitor {
 
     private func isSystemInFullscreenTransition() -> Bool {
         guard let front = NSWorkspace.shared.frontmostApplication else { return false }
+        if ownsDisplayCoveringWindow(front.processIdentifier) { return true }
+
         let axApp = AXUIElementCreateApplication(front.processIdentifier)
         AXUIElementSetMessagingTimeout(axApp, 0.3)
         var windowsValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsValue) == .success,
-              let windows = windowsValue as? [AXUIElement] else {
+        let result = AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsValue)
+        // A busy frontmost app (e.g. a game loading a level) times out. Its
+        // fullscreen state is then unknown, so assume it is fullscreen.
+        if result == .cannotComplete { return true }
+        guard result == .success, let windows = windowsValue as? [AXUIElement] else {
             return false
         }
 
@@ -645,6 +650,28 @@ class AutoQuitMonitor {
             if screenSizes.contains(where: {
                 abs($0.width - windowSize.width) < tolerance && abs($0.height - windowSize.height) < tolerance
             }) { return true }
+        }
+        return false
+    }
+
+    // Asks the window server rather than the app, so it still works when the
+    // app is too busy to answer AX queries. Needs no Screen Recording access.
+    private func ownsDisplayCoveringWindow(_ pid: pid_t) -> Bool {
+        var displayCount: UInt32 = 0
+        guard CGGetActiveDisplayList(0, nil, &displayCount) == .success, displayCount > 0 else { return false }
+        var displays = [CGDirectDisplayID](repeating: 0, count: Int(displayCount))
+        guard CGGetActiveDisplayList(displayCount, &displays, &displayCount) == .success else { return false }
+        let displayBounds = displays.prefix(Int(displayCount)).map { CGDisplayBounds($0) }
+
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
+            return false
+        }
+        for info in list {
+            guard let ownerPID = info[kCGWindowOwnerPID as String] as? pid_t, ownerPID == pid,
+                  let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
+                  let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(dictionaryRepresentation: boundsDict) else { continue }
+            if displayBounds.contains(where: { bounds.contains($0) }) { return true }
         }
         return false
     }
