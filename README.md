@@ -1,4 +1,6 @@
-<meta name="google-site-verification" content="r0z_vUs08D2OidBKFLtlqudSiQeOEgoFSv7OOIEI_Bk" />
+<head>
+  <meta name="google-site-verification" content="r0z_vUs08D2OidBKFLtlqudSiQeOEgoFSv7OOIEI_Bk" />
+</head>
 
 <div align="center">
 <img src="TrueClose.iconset/icon_512x512.png" width=200 height=200>
