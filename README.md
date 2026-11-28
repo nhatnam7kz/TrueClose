@@ -1,26 +1,22 @@
 <div align="center">
-    <img src="TrueClose.iconset/icon_512x512.png" width=200 height=200>
-    <h1>TrueClose — Quit Mac Apps When Their Last Window Closes</h1>
-    <p>A tiny, free menu bar app for macOS that makes closing the last window really quit the app, like on Windows. Stop apps from lingering in the background and free up memory automatically.</p>
+<img src="TrueClose.iconset/icon_512x512.png" width=200 height=200>
+<h1>TrueClose — Quit Mac Apps When Their Last Window Closes</h1>
+<p>A tiny, free menu bar app for macOS that makes closing the last window really quit the app, like on Windows. Stop apps from lingering in the background and free up memory automatically.</p>
 </div>
 
 <div align="center">
-
-[![Download](https://img.shields.io/badge/download-latest-brightgreen?style=flat-square)](https://github.com/nhatnam7kz/TrueClose/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/nhatnam7kz/TrueClose/total?style=flat-square)](https://github.com/nhatnam7kz/TrueClose/releases)
-![Platform](https://img.shields.io/badge/platform-macOS-blue?style=flat-square)
-[![Homebrew](https://img.shields.io/badge/brew-nhatnam7kz%2Ftap-orange?style=flat-square)](#install)
-[![GitHub stars](https://img.shields.io/github/stars/nhatnam7kz/TrueClose?style=flat-square)](https://github.com/nhatnam7kz/TrueClose/stargazers)
-[![GitHub forks](https://img.shields.io/github/forks/nhatnam7kz/TrueClose?style=flat-square)](https://github.com/nhatnam7kz/TrueClose/network/members)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
+<a href="https://github.com/nhatnam7kz/TrueClose/releases/latest"><img src="https://img.shields.io/badge/download-latest-brightgreen?style=flat-square" alt="Download"></a>
+<a href="https://github.com/nhatnam7kz/TrueClose/releases"><img src="https://img.shields.io/github/downloads/nhatnam7kz/TrueClose/total?style=flat-square" alt="Downloads"></a>
+<img src="https://img.shields.io/badge/platform-macOS-blue?style=flat-square" alt="Platform">
+<a href="#install"><img src="https://img.shields.io/badge/brew-nhatnam7kz%2Ftap-orange?style=flat-square" alt="Homebrew"></a>
+<a href="https://github.com/nhatnam7kz/TrueClose/stargazers"><img src="https://img.shields.io/github/stars/nhatnam7kz/TrueClose?style=flat-square" alt="GitHub stars"></a>
+<a href="https://github.com/nhatnam7kz/TrueClose/network/members"><img src="https://img.shields.io/github/forks/nhatnam7kz/TrueClose?style=flat-square" alt="GitHub forks"></a>
+<a href="https://github.com/nhatnam7kz/TrueClose/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
 </div>
 
-> [!NOTE]
-> On macOS, clicking the red ✕ on an app's last window closes the window but **keeps the app running**. TrueClose quits it for you, so the Dock stays clean and idle apps stop using your RAM. Grab the latest build from the [releases page](https://github.com/nhatnam7kz/TrueClose/releases/latest).
+> **Note:** On macOS, clicking the red ✕ on an app's last window closes the window but **keeps the app running**. TrueClose quits it for you, so the Dock stays clean and idle apps stop using your RAM. Grab the latest build from the [releases page](https://github.com/nhatnam7kz/TrueClose/releases/latest).
 
-> [!TIP]
-> Some apps should keep running with no windows (music players, menu bar tools). Add them to the **Blacklist** in Settings and TrueClose will leave them alone.
+> **Tip:** Some apps should keep running with no windows (music players, menu bar tools). Add them to the **Blacklist** in Settings and TrueClose will leave them alone.
 
 ## Features
 
@@ -69,13 +65,12 @@ Click the TrueClose icon in the menu bar to **Pause/Resume**, open **Settings**,
 | **Rules** | Choose apps to exclude (Blacklist) or include (Whitelist) |
 | **Accessibility** | Shows permission status |
 
-> [!NOTE]
-> If you hide the menu bar icon, you can reopen Settings anytime with the **⌥⇧A** shortcut.
+> **Note:** If you hide the menu bar icon, you can reopen Settings anytime with the **⌥⇧A** shortcut.
 
 ## Build from source
 
 ```bash
-git clone https://github.com/nhatnam7kz/TrueClose.git
+git clone [https://github.com/nhatnam7kz/TrueClose.git](https://github.com/nhatnam7kz/TrueClose.git)
 cd TrueClose
 ./build.sh
 ```
@@ -101,22 +96,22 @@ defaults delete com.trueclose.app
 ## Gallery
 
 <table>
-  <tr>
-    <td align="center" valign="top" width="50%">
-      <b>Close the last window, the app quits</b>
-      <br><br>
-      <img src="media/demo.gif" width="100%" alt="Demo of TrueClose quitting an app after its last window is closed">
-      <br><br>
-      Close an app's last window with the red button. After the short delay you set, the app quits completely and disappears from the Dock instead of staying open in the background.
-    </td>
-    <td align="center" valign="top" width="50%">
-      <b>Simple settings</b>
-      <br><br>
-      <img src="media/settings.png" width="100%" alt="TrueClose settings window on macOS">
-      <br><br>
-      Pause TrueClose, set the delay before quitting, turn on launch at login, and hide the menu bar icon. The Rules tab manages your Blacklist / Whitelist.
-    </td>
-  </tr>
+<tr>
+<td align="center" valign="top" width="50%">
+<b>Close the last window, the app quits</b>
+<br><br>
+<img src="media/demo.gif" width="100%" alt="Demo of TrueClose quitting an app after its last window is closed">
+<br><br>
+Close an app's last window with the red button. After the short delay you set, the app quits completely and disappears from the Dock instead of staying open in the background.
+</td>
+<td align="center" valign="top" width="50%">
+<b>Simple settings</b>
+<br><br>
+<img src="media/settings.png" width="100%" alt="TrueClose settings window on macOS">
+<br><br>
+Pause TrueClose, set the delay before quitting, turn on launch at login, and hide the menu bar icon. The Rules tab manages your Blacklist / Whitelist.
+</td>
+</tr>
 </table>
 
 ## Contributing
@@ -125,4 +120,4 @@ Contributions are welcome! If you find an app that doesn't quit (or quits when i
 
 ## License
 
-[MIT](LICENSE) — TrueClose is free and open-source.
+[MIT](https://github.com/nhatnam7kz/TrueClose/blob/main/LICENSE) — TrueClose is free and open-source.
