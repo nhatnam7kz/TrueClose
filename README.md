@@ -1,3 +1,5 @@
+<meta name="google-site-verification" content="r0z_vUs08D2OidBKFLtlqudSiQeOEgoFSv7OOIEI_Bk" />
+
 <div align="center">
 <img src="TrueClose.iconset/icon_512x512.png" width=200 height=200>
 <h1>TrueClose — Quit Mac Apps When Their Last Window Closes</h1>
